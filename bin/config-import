@@ -1,0 +1,51 @@
+#!/bin/bash
+
+# Merge {commands, routines} JSON (passed as one argument) into config.json,
+# then (re)install the routine timers. Notifies success or failure so the
+# popup menu can close immediately and let the notification report the result.
+# With --dry-run, preview what would be imported and installed without writing.
+
+set -euo pipefail
+
+PLUGIN_BIN_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+source "$PLUGIN_BIN_DIR/lib.sh"
+
+dry=0
+if [[ ${1:-} == "--dry-run" ]]; then
+  dry=1
+  shift
+fi
+
+json="${1:-}"
+if [[ -z $json ]]; then
+  notify "Import failed: missing JSON"
+  exit 2
+fi
+if ! printf '%s' "$json" | jq -e 'type == "object"' >/dev/null; then
+  notify "Import failed: not a valid JSON object"
+  exit 1
+fi
+
+if (( dry )); then
+  echo "Dry run — nothing written or installed."
+  if [[ $(printf '%s' "$json" | jq '(.commands // {}) | length') -gt 0 ]]; then
+    echo "  commands:"
+    printf '%s' "$json" | jq -r '.commands // {} | to_entries[] | "    \"\(.value.phrase)\" → \(if .value.target then "\(.value.target) \(.value.method)" else "run (\(.value.lang // "bash"))" end)"'
+  fi
+  if [[ $(printf '%s' "$json" | jq '(.routines // {}) | length') -gt 0 ]]; then
+    echo "  routines (installed as systemd timers):"
+    printf '%s' "$json" | jq -r '.routines // {} | to_entries[] | "    \"\(.value.schedule)\" → \(.value.run // "")"'
+  fi
+  exit 0
+fi
+
+ncmd=$(printf '%s' "$json" | jq '(.commands // {}) | length')
+nrout=$(printf '%s' "$json" | jq '(.routines // {}) | length')
+
+config_write --argjson in "$json" \
+  '.commands = ((.commands // {}) + ($in.commands // {})) | .routines = ((.routines // {}) + ($in.routines // {}))'
+"$PLUGIN_BIN_DIR/routines" install >/dev/null 2>&1 || true
+
+cmdword="commands"; [[ $ncmd == 1 ]] && cmdword="command"
+routword="routines"; [[ $nrout == 1 ]] && routword="routine"
+notify "Imported $ncmd $cmdword and $nrout $routword"

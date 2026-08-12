@@ -1,0 +1,34 @@
+#!/bin/bash
+
+# Wake-word listener entry point. Run `wake-word-setup` once first.
+#   wake-word start    run in the background (systemd-run) or foreground
+#   wake-word stop     stop a running listener
+
+set -euo pipefail
+
+PLUGIN_BIN_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+source "$PLUGIN_BIN_DIR/lib.sh"
+
+VENV="$WAKE_WORD_VENV"
+PY="$VENV/bin/python"
+
+case "${1:-start}" in
+start | -d | --daemon)
+  [[ -x $PY ]] || { echo "wake-word: run bin/wake-word-setup first" >&2; exit 1; }
+  if have systemd-run; then
+    exec systemd-run --user --unit=genesis-wake-word "$PY" "$PLUGIN_BIN_DIR/wake-word.py"
+  fi
+  exec "$PY" "$PLUGIN_BIN_DIR/wake-word.py"
+  ;;
+stop)
+  if have systemctl; then
+    systemctl --user stop genesis-wake-word.service 2>/dev/null || true
+    systemctl --user reset-failed genesis-wake-word.service 2>/dev/null || true
+  fi
+  pkill -f "$PLUGIN_BIN_DIR/wake-word.py" 2>/dev/null || true
+  ;;
+*)
+  echo "Usage: wake-word {start|stop}" >&2
+  exit 2
+  ;;
+esac

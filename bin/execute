@@ -1,0 +1,273 @@
+#!/bin/bash
+
+# Perform an action produced by `bin/intent`.
+# Input is a JSON object on stdin (or $1): {"action":"...","args":{...}}.
+#
+# The caller is responsible for confirmation: this script runs the action
+# immediately. Destructive actions should have been confirmed first.
+
+set -euo pipefail
+
+PLUGIN_BIN_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+source "$PLUGIN_BIN_DIR/lib.sh"
+
+payload="${1:-}"
+[[ -n $payload ]] || payload=$(cat)
+
+action=$(printf '%s' "$payload" | jq -r '.action // "unknown"')
+args=$(printf '%s' "$payload" | jq -c '.args // {}')
+arg() { printf '%s' "$args" | jq -r --arg k "$1" '.[$k] // ""'; }
+
+# Hint shown when a custom command or routine fails and gets blocked.
+fix_hint="Fix it in Manage (right-click the microphone) to run it again."
+
+# Record a failed custom command and notify the user, then stop.
+fail_command() {
+  local phrase="$1" action="$2" message="$3"
+  set_error commands "$phrase" "$message"
+  log_action "$action" "failed: $phrase"
+  notify "Command failed: $phrase — $message. $fix_hint"
+}
+
+# Forward a Home Assistant request to the community "Home Assistant" plugin
+# (konradk/hass) over IPC. Notifies when the plugin isn't installed.
+hass_call() {
+  local method="$1" entity="$2"
+  if ! omarchy-shell hass "$method" "$entity" >/dev/null 2>&1; then
+    notify "Home Assistant plugin not found — install it with: omarchy plugin add https://github.com/konradk/hass.git"
+  fi
+}
+
+# --- TV device control (delegated to the Roku / Apple TV remote plugins) ---
+
+tv_plugin_dir() {
+  case "$1" in
+  roku) printf '%s' "$HOME/.config/omarchy/plugins/io.github.jalv13.roku" ;;
+  apple-tv) printf '%s' "$HOME/.config/omarchy/plugins/io.github.teevans.apple-tv-remote" ;;
+  esac
+}
+
+# Resolve the TV backend from config `tv.backend` (auto|roku|apple-tv|off),
+# with auto preferring Roku then Apple TV based on which plugin is installed.
+tv_backend() {
+  local want roku atv
+  want=$(config_get tv.backend "auto")
+  roku=$(tv_plugin_dir roku)
+  atv=$(tv_plugin_dir apple-tv)
+  case "$want" in
+  roku) [[ -d $roku ]] && echo roku ;;
+  apple-tv) [[ -d $atv ]] && echo apple-tv ;;
+  auto)
+    if [[ -d $roku ]]; then echo roku
+    elif [[ -d $atv ]]; then echo apple-tv
+    fi
+    ;;
+  esac
+}
+
+# Map a semantic TV command to the backend's key/action.
+tv_command() {
+  case "$1:$2" in
+  roku:power-on) echo PowerOn ;;
+  roku:power-off) echo PowerOff ;;
+  roku:play-pause) echo Play ;;
+  roku:home) echo Home ;;
+  roku:up) echo Up ;;
+  roku:down) echo Down ;;
+  roku:left) echo Left ;;
+  roku:right) echo Right ;;
+  roku:select) echo Select ;;
+  roku:back) echo Back ;;
+  apple-tv:power-on) echo wake ;;
+  apple-tv:power-off) echo sleep ;;
+  apple-tv:play-pause) echo play-pause ;;
+  apple-tv:home) echo home ;;
+  apple-tv:up) echo up ;;
+  apple-tv:down) echo down ;;
+  apple-tv:left) echo left ;;
+  apple-tv:right) echo right ;;
+  apple-tv:select) echo select ;;
+  apple-tv:back) echo back ;;
+  esac
+}
+
+tv_dispatch() {
+  local cmd="$1" backend key
+  backend=$(tv_backend)
+  if [[ -z $backend ]]; then
+    notify "No TV plugin found — install the Roku or Apple TV remote plugin."
+    return
+  fi
+  key=$(tv_command "$backend" "$cmd")
+  [[ -n $key ]] || return
+  if [[ $backend == "roku" ]]; then
+    omarchy-shell -q roku sendKey "$key"
+  else
+    "$(tv_plugin_dir apple-tv)/apple-tv-remote" "$key" >/dev/null 2>&1 || true
+  fi
+}
+
+# Now-playing line from playerctl (MPRIS); empty when nothing is playing.
+now_playing() {
+  playerctl metadata --format '{{ artist }} - {{ title }}' 2>/dev/null || true
+}
+
+log_action "$action" "dispatched"
+
+case "$action" in
+shutdown) exec omarchy-system-shutdown ;;
+reboot) exec omarchy-system-reboot ;;
+logout) exec omarchy-system-logout ;;
+lock) exec omarchy-system-lock ;;
+suspend) systemctl suspend ;;
+
+screenshot) exec omarchy-capture-screenshot ;;
+
+volume-up) omarchy-audio-output-volume raise ;;
+volume-down) omarchy-audio-output-volume lower ;;
+mute) omarchy-audio-output-volume mute-toggle ;;
+
+media-play) omarchy-shell -q media play ;;
+media-pause) omarchy-shell -q media pause ;;
+media-next) omarchy-shell -q media next ;;
+media-previous) omarchy-shell -q media previous ;;
+
+brightness-up) omarchy-brightness-display +5% ;;
+brightness-down) omarchy-brightness-display 5%- ;;
+
+speak) "$PLUGIN_BIN_DIR/speak" "$(arg text)" ;;
+nightlight) omarchy-toggle-nightlight ;;
+idle) omarchy-toggle-idle "$(arg mode)" ;;
+power-profile) omarchy-powerprofiles-set autodetect "$(arg profile)" ;;
+workspace) hyprctl dispatch workspace "$(arg number)" ;;
+theme) omarchy-theme-set "$(arg name)" ;;
+
+status)
+  type=$(arg type)
+  case "$type" in
+  battery) notify "Battery: $(omarchy-battery-status 2>/dev/null || true)" ;;
+  time) notify "It's $(date '+%H:%M on %A, %B %d')." ;;
+  media)
+    now=$(now_playing)
+    [[ -n $now ]] && notify "Now playing: $now" || notify "Nothing is playing"
+    ;;
+  esac
+  ;;
+
+ha-toggle)
+  entity=$(arg entity)
+  [[ -n $entity ]] || { echo "execute: ha-toggle needs an entity" >&2; exit 1; }
+  hass_call toggleEntity "$entity"
+  ;;
+
+ha-scene)
+  entity=$(arg entity)
+  [[ -n $entity ]] || { echo "execute: ha-scene needs an entity" >&2; exit 1; }
+  hass_call activate "$entity"
+  ;;
+
+tv)
+  cmd=$(arg command)
+  [[ -n $cmd ]] || { echo "execute: tv needs a command" >&2; exit 1; }
+  tv_dispatch "$cmd"
+  ;;
+
+ipc)
+  phrase=$(arg phrase)
+  target=$(arg target)
+  method=$(arg method)
+  [[ -n $target && -n $method ]] || { echo "execute: ipc needs target and method" >&2; exit 1; }
+  params=()
+  while IFS= read -r p; do params+=("$p"); done < <(printf '%s' "$args" | jq -r '.params[]?' 2>/dev/null || true)
+  if ! omarchy-shell "$target" "$method" "${params[@]}" >/dev/null 2>&1; then
+    fail_command "$phrase" "$action" "plugin '$target' not found, or '$method' failed"
+  else
+    clear_error commands "$phrase"
+    log_action "$action" "ok: $phrase"
+  fi
+  ;;
+
+run)
+  phrase=$(arg phrase)
+  script=$(arg command)
+  lang=$(arg lang)
+  [[ -n $script ]] || { echo "execute: run needs a command" >&2; exit 1; }
+
+  # Resolve the language to an interpreter and write the snippet to a temp
+  # file, so any language runs without shell-quoting the code.
+  if ! read -r interp ext < <(lang_info "${lang:-bash}"); then
+    fail_command "$phrase" "$action" "unknown language '$lang' (use bash, python, node, or ruby)"
+    exit 1
+  fi
+  if ! have "$interp"; then
+    fail_command "$phrase" "$action" "$interp is not installed"
+    exit 1
+  fi
+  code=$(mktemp --suffix=".$ext")
+  printf '%s\n' "$script" >"$code"
+  set +e
+  output=$("$interp" "$code" 2>&1)
+  rc=$?
+  set -e
+  rm -f "$code"
+  if (( rc != 0 )); then
+    set_error commands "$phrase" "$(printf '%s' "$output" | tail -3 | tr '\n' ' ')"
+    log_action "$action" "failed: $phrase"
+    notify "Command failed: $phrase — $(printf '%s' "$output" | tail -1 | head -c 120). $fix_hint"
+  else
+    clear_error commands "$phrase"
+    log_action "$action" "ok: $phrase"
+  fi
+  ;;
+
+failed)
+  phrase=$(arg phrase)
+  error=$(arg error)
+  log_action "$action" "blocked: $phrase"
+  notify "Command failed: $phrase — $error. $fix_hint"
+  ;;
+
+open)
+  target=$(arg target)
+  [[ -n $target ]] || { echo "execute: open needs a target" >&2; exit 1; }
+  if have uwsm-app; then
+    exec setsid uwsm-app -- "$target"
+  else
+    exec setsid "$target"
+  fi
+  ;;
+
+reminder)
+  minutes=$(arg minutes)
+  message=$(arg message)
+  [[ -n $message ]] || message="Reminder"
+  if (( minutes > 0 )); then
+    exec omarchy-reminder "$minutes" "$message"
+  else
+    if have omarchy-shell; then
+      omarchy-shell -q shell summon omarchy.reminders "{}"
+    fi
+    notify "Reminder: $message"
+  fi
+  ;;
+
+agent)
+  prompt=$(arg prompt)
+  [[ -n $prompt ]] || { echo "execute: agent needs a prompt" >&2; exit 1; }
+  # On success the agent is launched and never returns; on failure (missing
+  # binary or no default agent set) we explain.
+  if ! have omarchy-agent-prompt || ! omarchy-agent-prompt "$prompt"; then
+    notify "No AI agent available. Run: omarchy default agent claude"
+  fi
+  ;;
+
+unknown | "")
+  notify "I didn't understand that — the AI agent is off. Enable it (Manage → Agent)."
+  exit 1
+  ;;
+
+*)
+  echo "execute: unknown action '$action'" >&2
+  exit 1
+  ;;
+esac

@@ -1,0 +1,576 @@
+#!/bin/bash
+
+# Map free-form text to a structured action.
+# Prints a single JSON object to stdout:
+#   {"action":"<name>","label":"<human label>","needsConfirm":true|false,"args":{...}}
+#
+# Rule-based matching runs first. Anything the rules don't match is handed to
+# the user's default coding agent (`agent` action) when `agent.enabled` is
+# true, so Genesis runs AI for you rather than just answering.
+#
+# Usage: intent [text...]   (or read text from stdin)
+
+set -euo pipefail
+
+PLUGIN_BIN_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+source "$PLUGIN_BIN_DIR/lib.sh"
+
+text="${*:-}"
+[[ -n $text ]] || text=$(cat)
+
+emit() {
+  local action="$1" label="$2"
+  local args="${3:-}"
+  local force_confirm="${4:-}"
+  [[ -n $args ]] || args="{}"
+  local confirm=false
+  if [[ $force_confirm == "true" ]]; then
+    confirm=true
+  else
+    action_needs_confirm "$action" && confirm=true
+  fi
+  jq -nc --arg action "$action" --arg label "$label" --argjson confirm "$confirm" \
+    --argjson args "$args" \
+    '{action: $action, label: $label, needsConfirm: $confirm, args: $args}'
+}
+
+emit_reminder() {
+  local minutes="$1" message="$2" label="$3"
+  local jq_args
+  jq_args=$(jq -nc --arg minutes "$minutes" --arg message "$message" '{minutes: $minutes, message: $message}')
+  emit reminder "$label" "$jq_args"
+}
+
+emit_agent() {
+  local prompt="$1" jq_args
+  jq_args=$(jq -nc --arg prompt "$prompt" '{prompt: $prompt}')
+  # The agent runs with approval prompts bypassed, so it always requires
+  # on-screen confirmation before launch — a misheard or ambient phrase must
+  # not reach an unrestricted agent silently.
+  emit agent "Run this with AI agent" "$jq_args" "true"
+}
+
+emit_tv() {
+  local command="$1" label="$2"
+  local jq_args
+  jq_args=$(jq -nc --arg command "$command" '{command: $command}')
+  emit tv "$label" "$jq_args"
+}
+
+emit_tv_power() {
+  local onoff="$1"
+  if [[ $onoff == "on" ]]; then
+    emit_tv "power-on" "Turn on the TV"
+  else
+    emit_tv "power-off" "Turn off the TV"
+  fi
+}
+
+# Full syntax for creating/editing custom commands, shared between the
+# panel-menu "Ask AI" route below, the keyword-gated hints, and the general
+# agent fallback so the agent always knows how to register a command.
+command_howto() {
+  cat <<'EOF'
+Create or manage custom voice commands with the CLI at ~/.config/omarchy/plugins/genesis/bin/commands:
+
+  commands set [--name <name>] "<phrase>" "<target>" "<method>" [params...]
+      Map a phrase to a plugin IPC call.
+      Example: commands set --name "Do not disturb" "toggle do not disturb" notifications toggleDnd
+  commands run [--name <name>] [--lang <bash|python|node|ruby>] "<phrase>" "<command...>"
+      Map a phrase to a script (bash by default).
+      Example: commands run --name "Check disk space" "check disk space" "df -h /"
+      Example: commands run --lang python "count files" "import os; print(len(os.listdir('.')))"
+  commands remove "<phrase>"
+  commands list
+
+Always give every new command a short --name distinct from the phrase — the phrase is the voice trigger, the name is the display label the menu shows. Commands live in the commands section of ~/.config/genesis/config.json. Prefer delegating to existing Omarchy tools (omarchy-* commands, or omarchy-shell <target> <method> IPC) over ad-hoc scripts.
+EOF
+}
+
+routine_howto() {
+  cat <<'EOF'
+Create or manage scheduled routines with the CLI at ~/.config/omarchy/plugins/genesis/bin/routines:
+
+  routines set [--name <name>] [--lang <bash|python|node|ruby>] "<schedule>" "<command...>"
+      Recurring routine, compiled to a persistent systemd user timer.
+      Schedule is "HH:MM" (daily), "Mon-Fri HH:MM" (days + time), or a systemd OnCalendar expression.
+      Example: routines set --name "Morning greeting" "08:00" "omarchy-notification-send Good morning"
+      Example: routines set "Mon-Fri 18:00" "omarchy-shell hass activate scene.evening"
+  routines once [--lang <...>] "<delay>" "<command...>"
+      One-off after a delay (systemd span: 30s, 5m, 2h).
+  routines at [--lang <...>] "<time>" "<command...>"
+      One-off at a wallclock time ("15:00", "tomorrow").
+  routines remove ["<schedule>"]   (omit the schedule to remove all)
+  routines list
+
+Always give every new routine a short --name distinct from the schedule — the schedule is the trigger, the name is the display label the menu shows. Routines live in the routines section of ~/.config/genesis/config.json.
+EOF
+}
+
+[[ -n $text ]] || { emit unknown ""; exit 0; }
+
+# The panel menu's "Ask AI" prefixes the request with @command or @routine so
+# the agent is told to always register one — never merely answer. Route before
+# the rules so even a phrase that looks like a built-in action becomes a
+# command/routine instead of being executed.
+if [[ $text == @command[[:space:]]* ]]; then
+  emit_agent "$(command_howto)
+
+The user typed this in the panel's \"Ask AI\" box for Commands. ALWAYS register a command with bin/commands: turn the request into a phrase plus a plugin IPC call (commands set) or a script (commands run), give it a short --name, then create it. Never merely answer or explain — finish only after the command is registered.
+
+Request: ${text#@command }"
+  exit 0
+fi
+if [[ $text == @routine[[:space:]]* ]]; then
+  emit_agent "$(routine_howto)
+
+The user typed this in the panel's \"Ask AI\" box for Routines. ALWAYS register a routine with bin/routines: turn the request into a schedule plus a command, give it a short --name, then create it. Never merely answer or explain — finish only after the routine is registered.
+
+Request: ${text#@routine }"
+  exit 0
+fi
+
+# The panel menu's edit forms send "@updatecommand <phrase> :: <change>" (and the
+# routine twin) so the agent updates the specific entry the user is editing,
+# never creates or touches others. Route before the rules so a phrase that looks
+# like a built-in action still becomes an update, not an execution.
+# $1 is the kind (command|routine); the identity field, howto, and wording
+# follow from it.
+update_marker() {
+  local word="$1" req key request field howto rename cur prompt
+  case "$word" in
+  command) field="phrase"; howto="$(command_howto)"; rename="rename it" ;;
+  routine) field="schedule"; howto="$(routine_howto)"; rename="change its schedule" ;;
+  esac
+  req="${text#@update${word} }"
+  key="${req%% :: *}"
+  request="${req#* :: }"
+  cur=$(jq -c --arg k "$key" --arg f "$field" --arg s "${word}s" '.[$s] // {} | to_entries[] | select(.value[$f] == $k) | .value' "$CONFIG_FILE" 2>/dev/null | head -1 || true)
+  prompt="$howto"
+  [[ -n $cur ]] && prompt="$prompt
+
+Current $word \"$key\": $cur"
+  emit_agent "$prompt
+
+The user is editing the $word \"$key\" in the panel menu. Apply ONLY the change below to that specific $word — never create a new $word, $rename, or touch any other $word.
+
+Change requested: $request"
+}
+if [[ $text == @updatecommand[[:space:]]* ]]; then update_marker command; exit 0; fi
+if [[ $text == @updateroutine[[:space:]]* ]]; then update_marker routine; exit 0; fi
+
+norm=$(normalize_text "$text")
+
+# Shared word lists used across the phrasing rules below.
+computer="(computer|pc|machine|laptop|system|device)"
+article="(the|my|this)?"
+tv="(tv|television|roku|apple[[:space:]]tv)"
+
+# --- TV (delegated to the Roku / Apple TV remote plugins) ------------------
+# Matched before the system rules so "power off the tv" reaches the TV and not
+# the shutdown action.
+
+if [[ $norm =~ ^(turn|switch|power)[[:space:]](on|off)[[:space:]](the|my|our)?[[:space:]]?$tv$ ]]; then
+  emit_tv_power "${BASH_REMATCH[2]}"
+  exit 0
+fi
+
+if [[ $norm =~ ^(turn|switch)[[:space:]](the|my|our)?[[:space:]]?$tv[[:space:]](on|off)$ ]]; then
+  emit_tv_power "${BASH_REMATCH[4]}"
+  exit 0
+fi
+
+if [[ $norm =~ ^$tv[[:space:]](on|off)$ ]]; then
+  emit_tv_power "${BASH_REMATCH[2]}"
+  exit 0
+fi
+
+if [[ $norm =~ ^(play|pause|resume)[[:space:]](the|my|our)?[[:space:]]?$tv$ ]]; then
+  emit_tv "play-pause" "Toggle TV playback"
+  exit 0
+fi
+
+if [[ $norm =~ ^$tv[[:space:]]home$|^home[[:space:]]screen$ ]]; then
+  emit_tv "home" "Go to the TV home screen"
+  exit 0
+fi
+
+if [[ $norm =~ ^$tv[[:space:]](up|down|left|right|select|ok|back)$ ]]; then
+  key="${BASH_REMATCH[2]}"
+  [[ $key == "ok" ]] && key="select"
+  emit_tv "$key" "Press $key on the TV"
+  exit 0
+fi
+
+# --- destructive / system ------------------------------------------------
+
+if [[ $norm =~ (shut[[:space:]]?down|power[[:space:]](off|down)($|[[:space:]]$article[[:space:]]?$computer)|turn[[:space:]]off[[:space:]]$article[[:space:]]?$computer|turn[[:space:]]$article[[:space:]]?$computer[[:space:]]off|switch[[:space:]]off[[:space:]]$article[[:space:]]?$computer|switch[[:space:]]$article[[:space:]]?$computer[[:space:]]off|shut[[:space:]]$article[[:space:]]?$computer[[:space:]]down|shut[[:space:]]it[[:space:]]down) ]]; then
+  emit shutdown "Shut down the computer"
+  exit 0
+fi
+
+if [[ $norm =~ (reboot|restart[[:space:]]now|restart[[:space:]]$article[[:space:]]?$computer) ]]; then
+  emit reboot "Reboot the computer"
+  exit 0
+fi
+
+if [[ $norm =~ (log[[:space:]]?(me[[:space:]])?(out|off)|sign[[:space:]]?(me[[:space:]])?(out|off)) ]]; then
+  emit logout "Log out of the session"
+  exit 0
+fi
+
+if [[ $norm =~ lock[[:space:]]$article[[:space:]]?(screen|computer|pc|machine|system|device) ]]; then
+  emit lock "Lock the screen"
+  exit 0
+fi
+
+if [[ $norm =~ (go[[:space:]]to[[:space:]]sleep|put[[:space:]]$article[[:space:]]?$computer[[:space:]]to[[:space:]]sleep|put[[:space:]]it[[:space:]]to[[:space:]]sleep|suspend|hibernate) ]]; then
+  emit suspend "Suspend the computer"
+  exit 0
+fi
+
+# --- capture --------------------------------------------------------------
+
+if [[ $norm =~ (screenshot|screen[[:space:]]shot|screen[[:space:]]capture|take[[:space:]](a[[:space:]])?(screenshot|snapshot|picture[[:space:]]of[[:space:]](the[[:space:]])?screen)|capture[[:space:]](the[[:space:]])?(screen|screenshot)) ]]; then
+  emit screenshot "Take a screenshot"
+  exit 0
+fi
+
+# --- audio ----------------------------------------------------------------
+
+if [[ $norm =~ (volume|sound)[[:space:]]up|increase[[:space:]]$article[[:space:]]?(volume|sound)|raise[[:space:]]$article[[:space:]]?(volume|sound)|louder|turn[[:space:]]up[[:space:]]$article[[:space:]]?volume|turn[[:space:]]$article[[:space:]]?volume[[:space:]]up ]]; then
+  emit volume-up "Turn volume up" '{"step":"+5%"}'
+  exit 0
+fi
+
+if [[ $norm =~ (volume|sound)[[:space:]]down|decrease[[:space:]]$article[[:space:]]?(volume|sound)|lower[[:space:]]$article[[:space:]]?(volume|sound)|quieter|turn[[:space:]]down[[:space:]]$article[[:space:]]?volume|turn[[:space:]]$article[[:space:]]?volume[[:space:]]down ]]; then
+  emit volume-down "Turn volume down" '{"step":"-5%"}'
+  exit 0
+fi
+
+if [[ $norm =~ (^|[[:space:]])mute([[:space:]]|$)|unmute ]]; then
+  emit mute "Toggle mute"
+  exit 0
+fi
+
+# --- media -----------------------------------------------------------------
+
+if [[ $norm =~ ^(play|resume)[[:space:]]((the|my|a|an|some)[[:space:]])?(music|audio|song|track|playlist) ]]; then
+  emit media-play "Play music"
+  exit 0
+fi
+
+if [[ $norm =~ ^(pause|stop)[[:space:]]((the|my|a|an|some)[[:space:]])?(music|audio|song|track|playback|playlist) ]]; then
+  emit media-pause "Pause music"
+  exit 0
+fi
+
+if [[ $norm =~ (next|skip)[[:space:]](song|track|one)|^next$|^skip$ ]]; then
+  emit media-next "Next track"
+  exit 0
+fi
+
+if [[ $norm =~ (previous|last)[[:space:]](song|track)|^previous$|^prev$ ]]; then
+  emit media-previous "Previous track"
+  exit 0
+fi
+
+# --- brightness -----------------------------------------------------------
+
+if [[ $norm =~ brightness[[:space:]]up|increase[[:space:]]$article[[:space:]]?brightness|raise[[:space:]]$article[[:space:]]?brightness|brighter|turn[[:space:]]up[[:space:]]$article[[:space:]]?brightness|turn[[:space:]]$article[[:space:]]?brightness[[:space:]]up ]]; then
+  emit brightness-up "Increase brightness" '{"step":"+5%"}'
+  exit 0
+fi
+
+if [[ $norm =~ brightness[[:space:]]down|decrease[[:space:]]$article[[:space:]]?brightness|lower[[:space:]]$article[[:space:]]?brightness|dimmer|dim[[:space:]]the[[:space:]]screen|turn[[:space:]]down[[:space:]]$article[[:space:]]?brightness|turn[[:space:]]$article[[:space:]]?brightness[[:space:]]down ]]; then
+  emit brightness-down "Decrease brightness" '{"step":"5%-"}'
+  exit 0
+fi
+
+# --- Home Assistant devices (delegated) ------------------------------------
+#
+# Device control is delegated to the community "Home Assistant" plugin
+# (konradk/hass) over IPC. Spoken names resolve through the
+# `homeAssistant.entities` alias map; only configured aliases ever resolve, so
+# an unknown device falls through to the agent.
+
+if [[ $norm =~ ^(toggle|turn|switch|flip|power)[[:space:]](on|off)?[[:space:]]?(the|my|our)?[[:space:]]?(.+)$ ]]; then
+  name="${BASH_REMATCH[4]}"
+  entity=$(resolve_entity "$name")
+  if [[ -n $entity ]]; then
+    jq_args=$(jq -nc --arg entity "$entity" '{entity: $entity}')
+    emit ha-toggle "Toggle $name" "$jq_args"
+    exit 0
+  fi
+fi
+
+if [[ $norm =~ ^(activate|run|start|trigger)[[:space:]](the|my|our)?[[:space:]]?(.+)$ ]]; then
+  name="${BASH_REMATCH[3]}"
+  entity=$(resolve_entity "$name")
+  if [[ -n $entity && $entity == scene.* ]]; then
+    jq_args=$(jq -nc --arg entity "$entity" '{entity: $entity}')
+    emit ha-scene "Activate $name" "$jq_args"
+    exit 0
+  fi
+fi
+
+# --- launch an app --------------------------------------------------------
+
+if [[ $norm =~ ^(open|launch|start|run|bring[[:space:]]up)[[:space:]]+(.+)$ ]]; then
+  app="${BASH_REMATCH[2]}"
+  app=$(printf '%s' "$app" | sed -E 's/^(a|an|the)[[:space:]]+//; s/^[[:space:]]+//; s/[[:space:]]+$//')
+  if [[ -n $app ]]; then
+    jq_args=$(jq -nc --arg target "$app" '{target: $target}')
+    emit open "Open $app" "$jq_args"
+    exit 0
+  fi
+fi
+
+# --- reminder -------------------------------------------------------------
+
+if [[ $norm =~ remind[[:space:]]me[[:space:]](in[[:space:]])?([0-9]+)[[:space:]](minutes|mins|minute|min)[[:space:]]?(to|about)?[[:space:]]?(.*)$ ]]; then
+  emit_reminder "${BASH_REMATCH[2]}" "${BASH_REMATCH[5]}" "Set a reminder in ${BASH_REMATCH[2]} minutes"
+  exit 0
+fi
+
+if [[ $norm =~ remind[[:space:]]me[[:space:]](to|about)?[[:space:]]?(.+) ]]; then
+  emit_reminder "0" "${BASH_REMATCH[2]}" "Set a reminder"
+  exit 0
+fi
+
+if [[ $norm =~ (set|make|create)[[:space:]](a|an)[[:space:]]?(reminder|alarm)[[:space:]]?(to|for|about)?[[:space:]]?(.*) ]]; then
+  emit_reminder "0" "${BASH_REMATCH[5]}" "Set a reminder"
+  exit 0
+fi
+
+# --- extras (TTS, toggles, status) -----------------------------------------
+# "say" and "theme" detect on the normalized text, then extract the payload from
+# the original text (case/punctuation preserved) so the spoken words or theme
+# name reach the command unchanged.
+
+if [[ $norm =~ ^(say|speak|announce|repeat)[[:space:]] ]]; then
+  say_text=$(printf '%s' "$text" | sed -E 's/^[[:space:]]*(say|speak|announce|repeat)[[:space:]]+//i')
+  jq_args=$(jq -nc --arg text "$say_text" '{text: $text}')
+  emit speak "Say \"$say_text\"" "$jq_args"
+  exit 0
+fi
+
+if [[ $norm =~ (night[[:space:]]?light|nightlight) ]]; then
+  emit nightlight "Toggle night light"
+  exit 0
+fi
+
+if [[ $norm =~ stay[[:space:]]awake|keep[[:space:]]awake ]]; then
+  emit idle "Stay awake" '{"mode":"stay-awake"}'
+  exit 0
+fi
+
+if [[ $norm =~ allow[[:space:]]idle|stop[[:space:]]staying[[:space:]]awake|idle[[:space:]]normally ]]; then
+  emit idle "Allow idle" '{"mode":"allow-idle"}'
+  exit 0
+fi
+
+if [[ $norm =~ power[[:space:]](mode|profile)[[:space:]]?(to)?[[:space:]]?(performance|balanced|power[[:space:]]saver|powersaver) ]]; then
+  profile="${BASH_REMATCH[3]}"
+  case "$profile" in
+  "power saver" | powersaver) profile="power-saver" ;;
+  esac
+  jq_args=$(jq -nc --arg profile "$profile" '{profile: $profile}')
+  emit power-profile "Power mode $profile" "$jq_args"
+  exit 0
+fi
+
+if [[ $norm =~ (go|switch|move)?[[:space:]]?(to[[:space:]])?workspace[[:space:]]+([0-9]+) ]]; then
+  number="${BASH_REMATCH[3]}"
+  jq_args=$(jq -nc --arg number "$number" '{number: $number}')
+  emit workspace "Workspace $number" "$jq_args"
+  exit 0
+fi
+
+if [[ $norm =~ (set|switch|change|apply)[[:space:]](the[[:space:]])?theme[[:space:]]to ]]; then
+  name=$(printf '%s' "$text" | sed -E 's/^.*theme[[:space:]]to[[:space:]]+//i')
+  name=$(printf '%s' "$name" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+  jq_args=$(jq -nc --arg name "$name" '{name: $name}')
+  emit theme "Theme $name" "$jq_args"
+  exit 0
+fi
+
+if [[ $norm =~ (^|[[:space:]])battery([[:space:]]|$) ]]; then
+  emit status "Battery status" '{"type":"battery"}'
+  exit 0
+fi
+
+if [[ $norm =~ (what[[:space:]]time[[:space:]]is[[:space:]]it|whats[[:space:]]the[[:space:]]time|the[[:space:]]time|^time$) ]]; then
+  emit status "Current time" '{"type":"time"}'
+  exit 0
+fi
+
+if [[ $norm =~ (whats[[:space:]]playing|now[[:space:]]playing|what[[:space:]]is[[:space:]]playing) ]]; then
+  emit status "Now playing" '{"type":"media"}'
+  exit 0
+fi
+
+# --- custom commands (plugin IPC registry) ----------------------------------
+# Phrases registered under `commands` in config map to arbitrary plugin IPC
+# calls or shell workflows, letting users and other plugins extend Genesis
+# without changing its code. Built-in rules above take precedence; the longest
+# matching phrase wins.
+
+# Print each registered command as "<phrase>\t<spec-json>", longest phrase first.
+command_entries() {
+  jq -r '.commands // {} | to_entries | sort_by(.value.phrase | length) | reverse | .[] | "\(.value.phrase)\t\(.value | tojson)"' "$CONFIG_FILE" 2>/dev/null || true
+}
+
+if [[ -f $CONFIG_FILE ]]; then
+  while IFS=$'\t' read -r phrase spec; do
+    [[ -n $phrase ]] || continue
+    key=$(normalize_text "$phrase")
+    [[ -z $key || " $norm " != *" $key "* ]] && continue
+
+    # A command that failed last time is blocked until the user fixes it.
+    error=$(get_error commands "$phrase")
+    if [[ -n $error ]]; then
+      jq_args=$(jq -nc --arg phrase "$phrase" --arg error "$error" '{phrase: $phrase, error: $error}')
+      emit failed "$phrase" "$jq_args"
+      exit 0
+    fi
+
+    command=$(printf '%s' "$spec" | jq -r '.run // empty' 2>/dev/null || true)
+    if [[ -n $command ]]; then
+      lang=$(printf '%s' "$spec" | jq -r '.lang // empty' 2>/dev/null || true)
+      jq_args=$(jq -nc --arg phrase "$phrase" --arg command "$command" --arg lang "$lang" '{phrase: $phrase, command: $command, lang: $lang}')
+      emit run "$phrase" "$jq_args"
+      exit 0
+    fi
+
+    target=$(printf '%s' "$spec" | jq -r '.target // empty' 2>/dev/null || true)
+    method=$(printf '%s' "$spec" | jq -r '.method // empty' 2>/dev/null || true)
+    [[ -n $target && -n $method ]] || continue
+    params=$(printf '%s' "$spec" | jq -c '.params // []' 2>/dev/null || true)
+    jq_args=$(jq -nc --arg phrase "$phrase" --arg target "$target" --arg method "$method" --argjson params "$params" \
+      '{phrase: $phrase, target: $target, method: $method, params: $params}')
+    emit ipc "$phrase" "$jq_args"
+    exit 0
+  done < <(command_entries)
+fi
+
+# --- AI agent fallback -----------------------------------------------------
+# Anything the rules didn't match goes to the user's default coding agent
+# (Claude Code, Codex, Gemini, …) via `omarchy-agent-prompt`. Set
+# `agent.enabled` to false to disable and fall through to "unknown".
+
+# Describe the registered custom commands as tools the agent can invoke, so it
+# can dynamically interpret a request and call the right one with arguments
+# extracted from what the user said.
+custom_tools() {
+  while IFS=$'\t' read -r phrase spec; do
+    [[ -n $phrase ]] || continue
+    target=$(printf '%s' "$spec" | jq -r '.target // empty' 2>/dev/null || true)
+    method=$(printf '%s' "$spec" | jq -r '.method // empty' 2>/dev/null || true)
+    run=$(printf '%s' "$spec" | jq -r '.run // empty' 2>/dev/null || true)
+    lang=$(printf '%s' "$spec" | jq -r '.lang // empty' 2>/dev/null || true)
+    if [[ -n $target && -n $method ]]; then
+      printf '  - "%s" -> omarchy-shell %s %s [args…]\n' "$phrase" "$target" "$method"
+    elif [[ -n $run ]]; then
+      printf '  - "%s" -> script (%s): %s\n' "$phrase" "${lang:-bash}" "$run"
+    fi
+  done < <(command_entries)
+}
+
+# Full-spec listing of registered routines (schedule + JSON spec), so a voice
+# update is based on the routine's current definition rather than a summary.
+routine_entries() {
+  jq -r '.routines // {} | to_entries | sort_by(.value.schedule) | .[] | "\(.value.schedule)\t\(.value | tojson)"' "$CONFIG_FILE" 2>/dev/null || true
+}
+
+# List the built-in actions the agent can trigger by sending a phrase through
+# the pipeline, which re-matches it and enforces confirmation where needed.
+builtin_tools() {
+  cat <<'EOF'
+  - shutdown — "shut down the computer" (confirmation required)
+  - reboot — "reboot" (confirmation required)
+  - logout — "log out" (confirmation required)
+  - lock — "lock the screen"
+  - suspend — "suspend"
+  - screenshot — "take a screenshot"
+  - volume — "turn the volume up" / "turn the volume down" / "mute"
+  - media — "play music" / "pause music" / "next song" / "previous song"
+  - brightness — "brightness up" / "brightness down"
+  - TV — "turn on the tv" / "turn off the tv" / "pause the tv" / "tv home"
+  - smart home — "toggle the <room> lights" / "turn off the <room> lights" / "activate <scene>"
+  - open an app — "open <app name>"
+  - reminder — "remind me in <n> minutes to <message>"
+  - night light — "toggle night light"
+  - idle — "stay awake" / "allow idle"
+  - power profile — "power mode performance" / "power mode balanced" / "power mode power saver"
+  - workspace — "go to workspace <number>"
+  - theme — "set theme to <name>"
+  - status — "battery status" / "what time is it" / "what's playing"
+  - speak — "say <text>"
+EOF
+}
+
+# Voice command/routine management is handed to the agent with a hint, so
+# "add a command to toggle do not disturb", "update my joke command", and
+# "change my 09:00 routine to 08:00" all use the CLIs rather than a hand edit.
+# The registered entries are listed so the agent targets the exact one named.
+# $1 is the kind (command|routine).
+manage_marker() {
+  local word="$1" prompt entries key spec verb
+  if [[ $word == "command" ]]; then
+    prompt="$(command_howto)"; entries=$(command_entries); verb="rename"
+  else
+    prompt="$(routine_howto)"; entries=$(routine_entries); verb="change"
+  fi
+  if [[ -n $entries ]]; then
+    prompt="$prompt
+
+Existing ${word}s (full current definition; update or remove only the one the user names):"
+    while IFS=$'\t' read -r key spec; do
+      [[ -n $key ]] || continue
+      prompt="$prompt
+  - $spec"
+    done <<< "$entries"
+  fi
+  emit_agent "$prompt
+
+Only make the change the user asked for: if they name an existing $word, update or remove exactly that one; if they ask to add, create exactly one new $word. Never create, $verb, or remove unrelated ${word}s.
+
+Request: $text"
+}
+if [[ $norm =~ (add|create|make|new|remove|delete|set|change|edit|update|modify|rename)[[:space:]](a|an|the|my|our)?[[:space:]]?.*commands?([[:space:]]|$) ]]; then
+  manage_marker command
+  exit 0
+fi
+if [[ $norm =~ (^|[[:space:]])routines?([[:space:]]|$) ]]; then
+  manage_marker routine
+  exit 0
+fi
+
+agent_enabled=$(config_get agent.enabled "false")
+if [[ $agent_enabled == "true" ]]; then
+  tools=$(custom_tools)
+  prompt="Trigger a built-in action by running: omarchy-shell -q genesis text \"<a phrase below>\". Genesis re-matches the phrase and enforces confirmation for destructive actions (shutdown, reboot, logout).
+
+Built-in actions:
+$(builtin_tools)"
+  if [[ -n $tools ]]; then
+    prompt="$prompt
+
+Custom commands (invoke directly, extracting any dynamic arguments from the request):
+$tools"
+  fi
+  prompt="$prompt
+
+To create or manage commands and routines, use the CLIs below:
+
+$(command_howto)
+
+$(routine_howto)"
+  emit_agent "$prompt
+
+Request: $text"
+  exit 0
+fi
+
+emit unknown "I didn't understand that — the AI agent is off. Enable it (Manage → Agent) to handle open-ended requests."

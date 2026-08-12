@@ -1,0 +1,92 @@
+#!/bin/bash
+
+# Manage custom voice commands (the `commands` config registry).
+#
+#   commands set [--name <name>] <phrase> <target> <method> [param...]
+#                                                        add/update an IPC command
+#   commands run [--name <name>] [--lang <bash|python|node|ruby>] <phrase> <command...>
+#                                                        add/update a script
+#   commands remove <phrase>                              remove a command
+#   commands list                                         list commands
+#   commands export [file]                                write commands as JSON
+#   commands import <file>                                merge commands from JSON
+#
+# Entries live in the `commands` map of config.json, keyed by a stable id (a
+# slug of the name, or the phrase). Each entry carries its own `phrase` (the
+# voice trigger that speech is matched against) and an optional `name` (display
+# label). An entry is either `{ target, method, params }` (a plugin IPC call)
+# or `{ run, lang }` (a script; `lang` defaults to bash).
+
+set -euo pipefail
+
+PLUGIN_BIN_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+source "$PLUGIN_BIN_DIR/lib.sh"
+
+set_ipc() {
+  local name=""
+  if [[ ${1:-} == "--name" ]]; then name="$2"; shift 2; fi
+  local phrase="$1" target="$2" method="$3"
+  shift 3
+  local params_json
+  params_json=$(jq -nc --args '$ARGS.positional' "$@" 2>/dev/null || echo '[]')
+  [[ -n $phrase && -n $target && -n $method ]] || { echo "Usage: commands set [--name <name>] <phrase> <target> <method> [param...]" >&2; exit 2; }
+  # A name that repeats the phrase adds no display value — drop it.
+  [[ $name == "$phrase" ]] && name=""
+  local id
+  id=$(resolve_entry_id commands phrase "$phrase" "$name")
+  config_write --arg id "$id" --arg p "$phrase" --arg t "$target" --arg m "$method" --argjson a "$params_json" --arg name "$name" \
+    '.commands = ((.commands // {}) + {($id): ({phrase: $p, name: $name, target: $t, method: $m, params: $a} | with_entries(select(.value != "" and .value != [])))})'
+  clear_error commands "$phrase"
+  echo "Set command \"$phrase\" → $target $method"
+}
+
+set_run() {
+  local lang="bash" name=""
+  while [[ ${1:-} == --* ]]; do
+    case "${1:-}" in
+    --lang) lang="$2"; shift 2 ;;
+    --name) name="$2"; shift 2 ;;
+    *) break ;;
+    esac
+  done
+  local phrase="$1"
+  shift
+  local command="$*"
+  [[ -n $phrase && -n $command ]] || { echo "Usage: commands run [--name <name>] [--lang <bash|python|node|ruby>] <phrase> <command...>" >&2; exit 2; }
+  # A name that repeats the phrase adds no display value — drop it.
+  [[ $name == "$phrase" ]] && name=""
+  lang=$(normalize_lang commands "$lang")
+  local id
+  id=$(resolve_entry_id commands phrase "$phrase" "$name")
+  config_write --arg id "$id" --arg p "$phrase" --arg c "$command" --arg l "$lang" --arg name "$name" \
+    '.commands = ((.commands // {}) + {($id): ({phrase: $p, run: $c, lang: $l, name: $name} | with_entries(select(.value != "")))})'
+  clear_error commands "$phrase"
+  echo "Set command \"$phrase\" → run (${lang:-bash})"
+}
+
+remove() {
+  local phrase="${1:-}"
+  [[ -n $phrase ]] || { echo "Usage: commands remove <phrase>" >&2; exit 2; }
+  config_write --arg p "$phrase" '.commands = (.commands // {} | to_entries | map(select(.value.phrase != $p)) | from_entries)'
+  echo "Removed command \"$phrase\""
+}
+
+list() {
+  jq -r '.commands // {} | to_entries[] | "\(.key)\t\(.value.phrase)\t\(.value | tojson)"' "$CONFIG_FILE" 2>/dev/null || true
+}
+
+export_commands() { config_export commands "$@"; }
+import_commands() { config_import commands "$@"; }
+
+case "${1:-}" in
+set) shift; set_ipc "$@" ;;
+run) shift; set_run "$@" ;;
+remove) shift; remove "$@" ;;
+list) list ;;
+export) shift; export_commands "$@" ;;
+import) shift; import_commands "$@" ;;
+*)
+  echo "Usage: commands {set [--name <name>] <phrase> <target> <method> [param...] | run [--name <name>] [--lang <bash|python|node|ruby>] <phrase> <command...> | remove <phrase> | list | export [file] | import <file>}" >&2
+  exit 2
+  ;;
+esac

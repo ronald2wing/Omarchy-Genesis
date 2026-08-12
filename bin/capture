@@ -1,0 +1,77 @@
+#!/bin/bash
+
+# Record microphone audio to a WAV file.
+#   capture start     begin recording in the background (idempotent)
+#   capture stop      stop recording and print the WAV path
+#   capture status    print "recording" or "idle"
+
+set -euo pipefail
+
+PLUGIN_BIN_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+source "$PLUGIN_BIN_DIR/lib.sh"
+
+ensure_runtime_dir
+
+is_recording() {
+  [[ -f $CAPTURE_PID ]] && kill -0 "$(cat "$CAPTURE_PID")" 2>/dev/null
+}
+
+start() {
+  if is_recording; then
+    echo "recording"
+    return 0
+  fi
+
+  local mic cmd=()
+  mic=$(config_get audio.microphone "default")
+
+  if have pw-record; then
+    cmd=(pw-record --rate 16000 --channels 1 --format s16)
+    [[ $mic != "default" ]] && cmd+=(--target "$mic")
+    cmd+=("$CAPTURE_WAV")
+  elif have parecord; then
+    cmd=(parecord --rate 16000 --channels 1 --format s16le)
+    [[ $mic != "default" ]] && cmd+=(--device "$mic")
+    cmd+=("$CAPTURE_WAV")
+  elif have arecord; then
+    cmd=(arecord -D "$mic" -r 16000 -c 1 -f S16_LE "$CAPTURE_WAV")
+  else
+    log_action "capture" "failed: no audio recorder available"
+    echo "no-recorder" >&2
+    exit 1
+  fi
+
+  rm -f "$CAPTURE_WAV"
+  nohup "${cmd[@]}" >/dev/null 2>&1 &
+  echo $! >"$CAPTURE_PID"
+  echo "recording"
+}
+
+stop() {
+  if [[ -f $CAPTURE_PID ]]; then
+    local pid
+    pid=$(cat "$CAPTURE_PID")
+    kill "$pid" 2>/dev/null || true
+    # Wait (bounded) for the recorder to flush and finalize the WAV header,
+    # instead of a blind fixed sleep.
+    local _i
+    for _i in 1 2 3 4 5 6 7 8 9 10; do
+      kill -0 "$pid" 2>/dev/null || break
+      sleep 0.1
+    done
+    rm -f "$CAPTURE_PID"
+  fi
+  if [[ -f $CAPTURE_WAV ]]; then
+    printf '%s\n' "$CAPTURE_WAV"
+  fi
+}
+
+case "${1:-}" in
+start) start ;;
+stop) stop ;;
+status) is_recording && echo "recording" || echo "idle" ;;
+*)
+  echo "Usage: capture {start|stop|status}" >&2
+  exit 2
+  ;;
+esac

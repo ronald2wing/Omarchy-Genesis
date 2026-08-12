@@ -1,0 +1,30 @@
+#!/bin/bash
+
+# Get or set the AI agent's enabled state (config `agent.enabled`).
+
+set -euo pipefail
+
+PLUGIN_BIN_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+source "$PLUGIN_BIN_DIR/lib.sh"
+
+state() {
+  [[ $(config_get agent.enabled "false") == "true" ]] && echo "enabled" || echo "disabled"
+}
+
+case "${1:-}" in
+on)
+  config_write '.agent.enabled = true'
+  state
+  ;;
+off)
+  config_write '.agent.enabled = false'
+  state
+  ;;
+toggle)
+  config_write '.agent.enabled = ((.agent.enabled // false) | not)'
+  state
+  ;;
+*)
+  state
+  ;;
+esac

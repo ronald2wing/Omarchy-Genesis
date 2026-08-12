@@ -1,0 +1,23 @@
+#!/bin/bash
+
+# Prompt for a typed command with Walker (or gum) and submit it to the running
+# Genesis service over IPC.
+#
+# Bind this to a key (e.g. SUPER + F8) to type commands instead of speaking.
+
+set -euo pipefail
+
+PLUGIN_BIN_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+source "$PLUGIN_BIN_DIR/lib.sh"
+
+text=""
+if have omarchy-menu-input; then
+  text=$(omarchy-menu-input "Command" --width 400 2>/dev/null || true)
+elif have gum; then
+  text=$(gum input --placeholder "Command…" 2>/dev/null || true)
+fi
+
+text=$(printf '%s' "$text" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+[[ -n $text ]] || exit 0
+
+omarchy-shell -q genesis text "$text"

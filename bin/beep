@@ -1,0 +1,64 @@
+#!/bin/bash
+
+# Play a short audio cue so the user knows listening started or stopped.
+#   beep start     higher tone (listening)
+#   beep stop      lower tone (processing)
+#
+# Tones are generated once with the Python standard library and played through
+# PipeWire/PulseAudio/ALSA. Respects the `audio.feedback` config flag.
+
+set -euo pipefail
+
+PLUGIN_BIN_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+source "$PLUGIN_BIN_DIR/lib.sh"
+
+feedback=$(config_get audio.feedback "true")
+[[ $feedback == "true" ]] || exit 0
+
+ensure_runtime_dir
+
+case "${1:-start}" in
+start) freq=880 ;;
+stop) freq=440 ;;
+*)
+  echo "Usage: beep {start|stop}" >&2
+  exit 2
+  ;;
+esac
+
+wav="$RUNTIME_DIR/beep-$freq.wav"
+
+if [[ ! -f $wav ]]; then
+  python3 - "$freq" "$wav" <<'PY'
+import math
+import struct
+import sys
+import wave
+
+freq = float(sys.argv[1])
+path = sys.argv[2]
+rate = 16000
+duration = 0.12
+samples = int(rate * duration)
+
+with wave.open(path, "w") as w:
+    w.setnchannels(1)
+    w.setsampwidth(2)
+    w.setframerate(rate)
+    frames = bytearray()
+    for i in range(samples):
+        t = i / rate
+        envelope = min(1.0, t * 100, (duration - t) * 100)
+        value = int(0.4 * 32767 * envelope * math.sin(2 * math.pi * freq * t))
+        frames += struct.pack("<h", value)
+    w.writeframes(bytes(frames))
+PY
+fi
+
+if have pw-play; then
+  pw-play "$wav" >/dev/null 2>&1 || true
+elif have paplay; then
+  paplay "$wav" >/dev/null 2>&1 || true
+elif have aplay; then
+  aplay -q "$wav" 2>/dev/null || true
+fi

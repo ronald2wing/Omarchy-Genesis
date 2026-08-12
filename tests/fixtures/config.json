@@ -1,0 +1,27 @@
+{
+  "agent": {
+    "enabled": true
+  },
+  "homeAssistant": {
+    "entities": {
+      "living room lights": "light.living_room",
+      "bedroom lights": "light.bedroom",
+      "office lights": "light.office",
+      "thermostat": "climate.home",
+      "movie mode": "scene.movie",
+      "movie": "scene.movie"
+    }
+  },
+  "audio": {
+    "microphone": "default"
+  },
+  "commands": {
+    "toggle-do-not-disturb": { "phrase": "toggle do not disturb", "target": "notifications", "method": "toggleDnd" },
+    "movie-time": { "phrase": "movie time", "run": "omarchy-shell roku sendKey PowerOn && omarchy-shell hass activate scene.movie" },
+    "check-disk-space": { "phrase": "check disk space", "run": "import shutil; print(shutil.disk_usage('/home').free // 2**30, 'GB free')", "lang": "python" }
+  },
+  "routines": {
+    "08-00": { "schedule": "08:00", "run": "echo hi" }
+  },
+  "confirmActions": ["shutdown", "reboot", "logout", "suspend"]
+}

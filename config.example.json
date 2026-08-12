@@ -1,0 +1,35 @@
+{
+  "agent": {
+    "enabled": false
+  },
+  "wakeWord": {
+    "model": "hey_jarvis",
+    "threshold": 0.5
+  },
+  "homeAssistant": {
+    "entities": {
+      "living room lights": "light.living_room",
+      "bedroom lights": "light.bedroom",
+      "thermostat": "climate.home",
+      "movie mode": "scene.movie"
+    }
+  },
+  "tv": {
+    "backend": "auto"
+  },
+  "commands": {
+    "focus-mode": { "phrase": "toggle do not disturb", "name": "Focus mode", "target": "notifications", "method": "toggleDnd" },
+    "movie-night": { "phrase": "movie time", "name": "Movie night", "run": "omarchy-shell roku sendKey PowerOn && omarchy-shell hass activate scene.movie" },
+    "check-disk-space": { "phrase": "check disk space", "run": "import shutil; print(shutil.disk_usage('/home').free // 2**30, 'GB free')", "lang": "python" }
+  },
+  "routines": {
+    "good-morning": { "schedule": "08:00", "name": "Good morning", "run": "omarchy-notification-send \"Good morning\" \"Rise and shine\"" },
+    "evening-scene": { "schedule": "Mon-Fri 18:00", "name": "Evening scene", "run": "omarchy-shell hass activate scene.evening" },
+    "stand-up": { "schedule": "17:00", "name": "Stand up", "run": "console.log('Stand up and stretch')", "lang": "node" }
+  },
+  "audio": {
+    "microphone": "default",
+    "feedback": true
+  },
+  "confirmActions": ["shutdown", "reboot", "logout", "suspend"]
+}

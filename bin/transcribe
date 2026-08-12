@@ -1,0 +1,37 @@
+#!/bin/bash
+
+# Convert a WAV file to text by delegating to Omarchy's voxtype dictation
+# engine. `voxtype transcribe` prints the transcription to stdout (standalone,
+# no daemon required) and inherits the model/engine from voxtype's own config.
+#
+# Usage: transcribe <file.wav>
+
+set -euo pipefail
+
+PLUGIN_BIN_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+source "$PLUGIN_BIN_DIR/lib.sh"
+
+wav="${1:-}"
+[[ -n $wav && -f $wav ]] || { echo "transcribe: missing or unreadable WAV file" >&2; exit 1; }
+
+have voxtype || {
+  log_action "transcribe" "failed: voxtype is not installed"
+  echo "voxtype is not installed (run: omarchy voxtype install, or Install → AI → Dictation in the Omarchy menu)" >&2
+  exit 1
+}
+
+# A recording with no samples (header + a few bytes) produces an empty
+# transcript; skip voxtype and report nothing.
+if [[ $(stat -c %s "$wav" 2>/dev/null || echo 0) -lt 1024 ]]; then
+  log_action "transcribe" "empty recording (no audio captured)" || true
+  rm -f "$wav"
+  exit 0
+fi
+
+# stderr is left visible (the service captures and shows it) so voxtype
+# failures are diagnosable instead of silently yielding an empty transcript.
+if ! voxtype transcribe "$wav"; then
+  log_action "transcribe" "voxtype transcription failed"
+  exit 1
+fi
+rm -f "$wav"

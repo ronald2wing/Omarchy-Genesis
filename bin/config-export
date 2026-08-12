@@ -1,0 +1,21 @@
+#!/bin/bash
+
+# Copy the commands + routines config to the clipboard (or print it when no
+# clipboard tool is available).
+
+set -euo pipefail
+
+PLUGIN_BIN_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+source "$PLUGIN_BIN_DIR/lib.sh"
+
+json=$(jq '{commands: (.commands // {}), routines: (.routines // {})}' "$CONFIG_FILE" 2>/dev/null || echo '{"commands":{},"routines":{}}')
+if have wl-copy; then
+  printf '%s' "$json" | wl-copy
+elif have xclip; then
+  printf '%s' "$json" | xclip -selection clipboard
+else
+  notify "Export failed: no clipboard tool (install wl-clipboard)"
+  printf '%s' "$json"
+  exit 0
+fi
+notify "Copied commands & routines to the clipboard"

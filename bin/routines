@@ -1,0 +1,292 @@
+#!/bin/bash
+
+# Manage scheduled routines as systemd user timers (persistent, survive reboot).
+#
+#   routines set [--name <name>] [--lang <bash|python|node|ruby>] <schedule> <command...>
+#   routines once [--lang <...>] <delay> <command...>   run once after a delay
+#   routines at [--lang <...>] <time> <command...>      run once at a wallclock time
+#   routines run <schedule>                run a routine's command now
+#   routines remove [<schedule>]           remove one routine (or all if omitted)
+#   routines install                       (re)install every routine from config
+#   routines list                          list installed routine timers
+#   routines export [file]                 write routines as JSON
+#   routines import [--dry-run] <file>    merge routines from JSON (and install)
+#
+# Schedules: "HH:MM" (daily), "Mon-Fri HH:MM" (days + time), or a full systemd
+# OnCalendar expression. Routines live in the `routines` map of config.json,
+# keyed by a stable id; each entry carries its `schedule` (the trigger), an
+# optional `name` (display label), `run`, and optional `lang` (default bash;
+# also python/node/ruby). `once`/`at` are transient — they run a single time
+# and clean up after themselves.
+
+set -euo pipefail
+
+PLUGIN_BIN_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+source "$PLUGIN_BIN_DIR/lib.sh"
+
+UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+PREFIX="genesis-routine"
+
+on_calendar() {
+  local s="$1"
+  if [[ $s =~ ^([0-9]{1,2}):([0-9]{2})$ ]]; then
+    printf '%s' "*-*-* ${BASH_REMATCH[1]}:${BASH_REMATCH[2]}:00"
+  elif [[ $s =~ ^([A-Za-z,-]+)[[:space:]]+([0-9]{1,2}):([0-9]{2})$ ]]; then
+    printf '%s' "$(printf '%s' "${BASH_REMATCH[1]}" | sed 's/-/../g') ${BASH_REMATCH[2]}:${BASH_REMATCH[3]}:00"
+  else
+    printf '%s' "$s"
+  fi
+}
+
+# True when a schedule is usable: "HH:MM", "Days HH:MM" (valid ranges), or a
+# full OnCalendar expression (which always contains a colon).
+valid_schedule() {
+  local s="$1"
+  if [[ $s =~ ^([0-9]{1,2}):([0-9]{2})$ ]]; then
+    (( 10#${BASH_REMATCH[1]} <= 23 )) && (( 10#${BASH_REMATCH[2]} <= 59 ))
+  elif [[ $s =~ ^([A-Za-z,-]+)[[:space:]]+([0-9]{1,2}):([0-9]{2})$ ]]; then
+    (( 10#${BASH_REMATCH[2]} <= 23 )) && (( 10#${BASH_REMATCH[3]} <= 59 ))
+  else
+    [[ $s == *:* ]]
+  fi
+}
+
+slug() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9'; }
+
+# Disable and remove every routine unit we own (idempotent).
+clear_units() {
+  local t
+  for t in "$UNIT_DIR"/$PREFIX-*.timer; do
+    [[ -f $t ]] || continue
+    systemctl --user disable --now "$(basename "$t")" >/dev/null 2>&1 || true
+  done
+  rm -f "$UNIT_DIR"/$PREFIX-*.timer "$UNIT_DIR"/$PREFIX-*.service "$UNIT_DIR"/$PREFIX-*.sh \
+    "$UNIT_DIR"/$PREFIX-*.py "$UNIT_DIR"/$PREFIX-*.js "$UNIT_DIR"/$PREFIX-*.rb
+}
+
+install() {
+  have systemctl || { echo "routines: systemctl is required" >&2; exit 1; }
+  mkdir -p "$UNIT_DIR"
+  clear_units
+
+  while IFS=$'\t' read -r schedule command lang; do
+    [[ -n $schedule && -n $command ]] || continue
+
+    # A routine that failed last time stays blocked until the user fixes it.
+    if [[ -n $(get_error routines "$schedule") ]]; then
+      echo "Skipped routine \"$schedule\" (failed — fix it with 'routines set' or Manage)"
+      continue
+    fi
+
+    if ! valid_schedule "$schedule"; then
+      echo "Skipped routine (invalid schedule): $schedule" >&2
+      continue
+    fi
+
+    local name oncal interp ext run_cmd
+    name="$PREFIX-$(slug "$schedule")"
+    oncal=$(on_calendar "$schedule")
+
+    # Resolve the language to an interpreter and file extension. Non-bash
+    # snippets are written to a companion file the wrapper invokes directly, so
+    # the code is never shell-quoted.
+    read -r interp ext < <(lang_info "$lang") || {
+      echo "Skipped routine (unknown language '$lang'): $schedule" >&2
+      continue
+    }
+    if [[ $interp == "bash" ]]; then
+      run_cmd=$command
+    else
+      have "$interp" || {
+        echo "Skipped routine ($interp not installed): $schedule" >&2
+        continue
+      }
+      printf '%s\n' "$command" >"$UNIT_DIR/$name.$ext"
+      run_cmd="$interp \"$UNIT_DIR/$name.$ext\""
+    fi
+
+    # The script records its own failure (into the error store) and disables its
+    # timer so a broken routine does not keep firing.
+    cat >"$UNIT_DIR/$name.sh" <<EOF
+#!/bin/bash
+set -euo pipefail
+source "$PLUGIN_BIN_DIR/lib.sh"
+LOG=\$(mktemp)
+if ! ( $run_cmd ) >"\$LOG" 2>&1; then
+  set_error routines "$schedule" "\$(tail -3 "\$LOG" | tr '\n' ' ')"
+  log_action "routine" "failed: $schedule"
+  systemctl --user disable --now "$name.timer" >/dev/null 2>&1 || true
+  notify "Routine failed: $schedule — \$(tail -1 "\$LOG" | head -c 120). Fix it in Manage (right-click the microphone)."
+else
+  log_action "routine" "ok: $schedule"
+fi
+rm -f "\$LOG"
+EOF
+    chmod +x "$UNIT_DIR/$name.sh"
+
+    cat >"$UNIT_DIR/$name.service" <<EOF
+[Unit]
+Description=Genesis routine: $schedule
+
+[Service]
+Type=oneshot
+ExecStart=$UNIT_DIR/$name.sh
+EOF
+
+    cat >"$UNIT_DIR/$name.timer" <<EOF
+[Unit]
+Description=Genesis routine timer: $schedule
+
+[Timer]
+OnCalendar=$oncal
+
+[Install]
+WantedBy=timers.target
+EOF
+
+    echo "Installed routine: $schedule"
+  done < <(jq -r '.routines // {} | to_entries[] | "\(.value.schedule)\t\(.value.run // empty)\t\(.value.lang // "")"' "$CONFIG_FILE" 2>/dev/null || true)
+
+  systemctl --user daemon-reload
+  for t in "$UNIT_DIR"/$PREFIX-*.timer; do
+    [[ -f $t ]] || continue
+    systemctl --user enable --now "$(basename "$t")" >/dev/null 2>&1 || true
+  done
+}
+
+set_routine() {
+  local lang="bash" name=""
+  while [[ ${1:-} == --* ]]; do
+    case "${1:-}" in
+    --lang) lang="$2"; shift 2 ;;
+    --name) name="$2"; shift 2 ;;
+    *) break ;;
+    esac
+  done
+  local schedule="$1"
+  shift
+  local command="$*"
+  [[ -n $schedule && -n $command ]] || { echo "Usage: routines set [--name <name>] [--lang <bash|python|node|ruby>] <schedule> <command...>" >&2; exit 2; }
+  # A name that repeats the schedule adds no display value — drop it.
+  [[ $name == "$schedule" ]] && name=""
+  valid_schedule "$schedule" || {
+    echo "routines: invalid schedule '$schedule' (use HH:MM, 'Mon-Fri HH:MM', or a systemd OnCalendar expression)" >&2
+    exit 2
+  }
+  lang=$(normalize_lang routines "$lang")
+  local id
+  id=$(resolve_entry_id routines schedule "$schedule" "$name")
+  config_write --arg id "$id" --arg s "$schedule" --arg c "$command" --arg l "$lang" --arg name "$name" \
+    '.routines = ((.routines // {}) + {($id): ({schedule: $s, run: $c, lang: $l, name: $name} | with_entries(select(.value != "")))})'
+  clear_error routines "$schedule"
+  install
+}
+
+remove_routine() {
+  local schedule="${1:-}"
+  if [[ -n $schedule ]]; then
+    config_write --arg s "$schedule" '.routines = (.routines // {} | to_entries | map(select(.value.schedule != $s)) | from_entries)'
+  else
+    config_write 'del(.routines)'
+  fi
+  install
+}
+
+list() {
+  systemctl --user list-timers "$PREFIX-*" --all --no-pager 2>/dev/null || true
+}
+
+# Run a command once as a transient systemd unit. $1 is the timer option
+# ("--on-active=<delay>" or "--on-calendar=<time>"); $2 is the human label.
+run_once() {
+  local when="$1" label="$2" lang="$3"
+  shift 3
+  local command="$*"
+  local interp flag
+  read -r interp _ < <(lang_info "$lang") || { echo "routines: unknown language '$lang' (use bash, python, node, or ruby)" >&2; exit 2; }
+  case "$interp" in
+    node | ruby) flag=-e ;;
+    *) flag=-c ;;
+  esac
+  have "$interp" || { echo "routines: $interp is not installed" >&2; exit 1; }
+  local unit
+  unit="$PREFIX-once-$(date +%s)"
+  if ! systemd-run --user --collect "$when" --unit="$unit" "$interp" "$flag" "$command" >/dev/null 2>&1; then
+    echo "routines: failed to schedule one-off ($when)" >&2
+    exit 1
+  fi
+  echo "Scheduled one-off routine $label: $command"
+}
+
+# Run a command once after a delay (systemd time span: 30s, 5m, 2h, …).
+once() {
+  local lang="bash"
+  if [[ ${1:-} == "--lang" ]]; then lang="$2"; shift 2; fi
+  local delay="$1"
+  shift
+  local command="$*"
+  [[ -n $delay && -n $command ]] || { echo "Usage: routines once [--lang <bash|python|node|ruby>] <delay> <command...>" >&2; exit 2; }
+  run_once "--on-active=$delay" "in $delay" "$lang" "$command"
+}
+
+# Run a command once at a wallclock time (systemd OnCalendar: "15:00",
+# "tomorrow", "2026-08-14 15:00", …). Fires at the next matching time.
+at() {
+  local lang="bash"
+  if [[ ${1:-} == "--lang" ]]; then lang="$2"; shift 2; fi
+  local schedule="$1"
+  shift
+  local command="$*"
+  [[ -n $schedule && -n $command ]] || { echo "Usage: routines at [--lang <bash|python|node|ruby>] <time> <command...>" >&2; exit 2; }
+  run_once "--on-calendar=$schedule" "at $schedule" "$lang" "$command"
+}
+
+# Run a routine's command now (once), without waiting for its schedule.
+run_now() {
+  local schedule="$1" spec command lang
+  spec=$(jq -c --arg k "$schedule" '.routines // {} | to_entries[] | select(.value.schedule == $k) | .value' "$CONFIG_FILE" 2>/dev/null | head -1 || true)
+  [[ -n $spec ]] || { echo "routines: no routine '$schedule'" >&2; exit 1; }
+  command=$(printf '%s' "$spec" | jq -r '.run // empty')
+  lang=$(printf '%s' "$spec" | jq -r '.lang // empty')
+  log_action "routine" "run now: $schedule"
+  run_once "--on-active=1s" "now" "${lang:-bash}" "$command"
+}
+
+# Merge routines from a JSON object file (same-key entries are overwritten),
+# then (re)install the timers. With --dry-run, preview the timers that would be
+# installed without writing config or touching systemd.
+import_routines() {
+  if [[ ${1:-} == "--dry-run" ]]; then
+    shift
+    local file="${1:-}"
+    [[ -n $file && -f $file ]] || { echo "Usage: routines import [--dry-run] <file>" >&2; exit 2; }
+    jq -e 'type == "object"' "$file" >/dev/null 2>&1 || { echo "import: $file is not a JSON object" >&2; exit 1; }
+    echo "Dry run — nothing written or installed."
+    jq -r '.routines // {} | to_entries[] | "  \"\(.value.schedule)\" → \(.value.run // "")  [timer]"' "$file" 2>/dev/null || true
+    exit 0
+  fi
+  config_import routines "$@"
+  install
+}
+
+export_routines() { config_export routines "$@"; }
+
+usage() {
+  echo "Usage: routines {set [--name <name>] [--lang <bash|python|node|ruby>] <schedule> <command...> | once [--lang <...>] <delay> <command...> | at [--lang <...>] <time> <command...> | run <schedule> | remove [<schedule>] | install | list | export [file] | import [--dry-run] <file>}" >&2
+}
+
+case "${1:-}" in
+set) shift; set_routine "$@" ;;
+once) shift; once "$@" ;;
+at) shift; at "$@" ;;
+run) shift; run_now "$@" ;;
+remove) shift; remove_routine "$@" ;;
+install) install ;;
+list) list ;;
+export) shift; export_routines "$@" ;;
+import) shift; import_routines "$@" ;;
+*)
+  usage
+  exit 2
+  ;;
+esac

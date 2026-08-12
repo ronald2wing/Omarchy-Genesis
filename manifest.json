@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "id": "genesis",
+  "name": "Genesis",
+  "version": "1.0.0",
+  "author": "ronald2wing",
+  "license": "Unlicense",
+  "description": "A voice-controlled AI agent for Omarchy: fast local commands (system, apps, media, smart home, TV) with requests handed to your coding agent (Claude Code, Codex, Gemini, …) to run AI for you.",
+  "kinds": [
+    "service",
+    "bar-widget"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "service": "Service.qml",
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Genesis",
+    "description": "Mic button: click to talk, right-click for the menu.",
+    "category": "Assistants",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

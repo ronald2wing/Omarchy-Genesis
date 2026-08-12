@@ -1,0 +1,24 @@
+#!/bin/bash
+
+# Speak text aloud via the first available local TTS engine. No hard dependency
+# — if none is installed, it exits silently (so the "say" command never errors).
+
+set -euo pipefail
+
+PLUGIN_BIN_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+source "$PLUGIN_BIN_DIR/lib.sh"
+
+text="${*:-}"
+[[ -n $text ]] || exit 0
+
+if have espeak-ng; then
+  espeak-ng "$text" >/dev/null 2>&1 || true
+elif have espeak; then
+  espeak "$text" >/dev/null 2>&1 || true
+elif have spd-say; then
+  spd-say "$text" >/dev/null 2>&1 || true
+elif have flite; then
+  flite -t "$text" >/dev/null 2>&1 || true
+fi
+
+exit 0

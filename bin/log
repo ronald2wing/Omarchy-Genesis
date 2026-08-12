@@ -1,0 +1,26 @@
+#!/bin/bash
+
+# Show recent Genesis activity (default: last 20 entries), or clear it.
+# Usage: log [count] | log clear [<phrase-or-schedule>]
+
+set -euo pipefail
+
+PLUGIN_BIN_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+source "$PLUGIN_BIN_DIR/lib.sh"
+
+if [[ ${1:-} == "clear" ]]; then
+  if [[ -n ${2:-} ]]; then
+    key="${*:2}"
+    json_write "$LOG_FILE" --arg k "$key" 'if type == "array" then map(select(.detail != "ok: " + $k and .detail != "failed: " + $k and .detail != "blocked: " + $k and .detail != "run now: " + $k)) else [] end'
+    echo "History cleared for \"$key\"."
+  else
+    json_write "$LOG_FILE" '[]'
+    echo "History cleared."
+  fi
+  exit 0
+fi
+
+n="${1:-20}"
+
+[[ -f $LOG_FILE ]] || { echo "No activity yet."; exit 0; }
+jq -r --argjson n "$n" '.[-$n:][] | "\(.at)  \(.action)\t\(.detail)"' "$LOG_FILE" 2>/dev/null || true
