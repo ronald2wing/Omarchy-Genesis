@@ -46,9 +46,6 @@ Triggers map to these methods:
   (a bar-widget `KeyboardPanel` under the icon, offering a typed command or the
   manage submenu).
 - A user-added keybind → `toggle` (or any other method).
-- Wake-word listener (openWakeWord, opt-in; skip it for the recommended
-  click-to-talk setup) → `begin`; the service's 10-second cap ends the session
-  automatically.
 
 Genesis registers no global keybinding of its own; any keyboard trigger is a
 user-owned Hyprland binding, so no plugin installer is required.
@@ -269,9 +266,8 @@ the action runs.
   directory (`~/.config/genesis/config.json` — deliberately outside the plugin
   dir, since the shell hot-reloads any plugin whose directory changes), the
   runtime directory (`$XDG_RUNTIME_DIR/genesis`), the state directory
-  (`~/.local/state/genesis`), the systemd user unit directory
-  (`~/.config/systemd/user/genesis-routine-*`), and the wake-word venv
-  (`~/.local/share/genesis/wake-word-venv`, opt-in).
+  (`~/.local/state/genesis`), and the systemd user unit directory
+  (`~/.config/systemd/user/genesis-routine-*`).
 - No Hyprland configuration is modified, and nothing needs to be removed beyond
   `omarchy plugin remove genesis` (and `bin/routines remove` for any installed
   timers).
@@ -284,8 +280,5 @@ only system-level calls it ever makes are, on the user's request:
 - `systemctl suspend` (the "suspend" action) and `systemctl --user` for its own
   `genesis-routine-*` timers (`bin/routines`). Omarchy has no suspend command of
   its own — suspend is logind's — so `systemctl suspend` is the idiomatic call.
-- `pip install` into a private venv, only when the user opts in to the wake word
-  (`bin/wake-word-setup`); this installs `openwakeword`, `onnxruntime`, and
-  `sounddevice` and nothing elsewhere.
 
 Everything else is delegated to existing `omarchy-*` commands or plugin IPC.

@@ -3,7 +3,6 @@
 # Static validation for the Genesis plugin without a Quattro machine:
 #   - manifest.json against the omarchy-plugin-validate rules
 #   - bash syntax for every script in bin/
-#   - Python syntax for bin/wake-word.py
 #   - JSON validity for config.example.json
 #
 # Usage: tests/validate.sh
@@ -49,19 +48,10 @@ echo "== scripts (bash -n) =="
 for f in "$PLUGIN_DIR"/bin/*; do
   [[ -f $f ]] || continue
   case "$f" in
-  *.py) continue ;;
   *.sh) continue ;;
   esac
   bash -n "$f" 2>/dev/null || { echo "FAIL: $f"; fail=$((fail + 1)); }
 done
-
-echo "== python (syntax) =="
-if command -v python3 >/dev/null 2>&1; then
-  python3 -c 'import ast, sys; ast.parse(open(sys.argv[1]).read())' "$PLUGIN_DIR/bin/wake-word.py" \
-    || { echo "FAIL: wake-word.py"; fail=$((fail + 1)); }
-else
-  echo "  (python3 not available; skipped)"
-fi
 
 echo "== config.example.json =="
 jq -e . "$PLUGIN_DIR/config.example.json" >/dev/null 2>&1 \

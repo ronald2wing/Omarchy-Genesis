@@ -22,7 +22,6 @@ fi
 RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/$PLUGIN_ID"
 CAPTURE_WAV="$RUNTIME_DIR/recording.wav"
 CAPTURE_PID="$RUNTIME_DIR/capture.pid"
-WAKE_WORD_VENV="${XDG_DATA_HOME:-$HOME/.local/share}/$PLUGIN_ID/wake-word-venv"
 
 # True when a command exists on PATH.
 have() { command -v "$1" >/dev/null 2>&1; }

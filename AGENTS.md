@@ -6,7 +6,7 @@ step — QML loaded by `omarchy-shell` plus shell scripts in `bin/`.
 ## Verify
 
 ```bash
-bash tests/validate.sh   # manifest schema, bash -n (bin/*), python syntax, JSON
+bash tests/validate.sh   # manifest schema, bash -n (bin/*), JSON
 bash tests/intent.sh     # intent matcher + entity resolution + error-blocking
 bash tests/routine.sh    # one-off scheduling (once/at) via a stubbed systemd-run
 bash tests/config.sh     # command/routine export + import (stubbed systemctl)
@@ -65,7 +65,7 @@ bash tests/config.sh     # command/routine export + import (stubbed systemctl)
 - `local` is only valid inside a function; `bin/execute`'s `case` body is
   top-level, so use plain variables there.
 - The plugin id `genesis` is hardcoded in several paths: `lib.sh` `PLUGIN_ID`,
-  `wake-word.py` `CONFIG`, `BarWidget.qml` `moduleName` and its `pluginDir`
+  `BarWidget.qml` `moduleName` and its `pluginDir`
   (bar widgets get no `manifest` injection), and the fallback in `Service.qml`
   `pluginDir` (which prefers the shell-injected `manifest.__sourceDir`).
   Renaming is not just a `manifest.json` edit.
@@ -100,8 +100,6 @@ bash tests/config.sh     # command/routine export + import (stubbed systemctl)
   `manifest.__sourceDir`. Reusable popup pieces are inline `component`s in
   `BarWidget.qml` (`RowBtn`, `Btn`, `Input`, `TextArea`, `MenuRow`, `RunBtn`,
   `ListRow`, `Segmented`, `EmptyState`).
-- Python: standard library only, except the openWakeWord stack installed into
-  its own venv.
 
 ## Tests & commits
 

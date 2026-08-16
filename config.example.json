@@ -2,10 +2,6 @@
   "agent": {
     "enabled": false
   },
-  "wakeWord": {
-    "model": "hey_jarvis",
-    "threshold": 0.5
-  },
   "homeAssistant": {
     "entities": {
       "living room lights": "light.living_room",

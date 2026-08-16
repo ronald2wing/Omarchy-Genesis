@@ -26,9 +26,8 @@ the defaults are sensible; copy `config.example.json` to
 `~/.config/genesis/config.json` only if you want to customize.
 
 This is the recommended **click-to-talk** setup. Leave the AI agent off (the
-default) and skip the wake-word setup: fast and custom commands are deterministic
-and fully offline. Read [AI agent](#ai-agent) and
-[Wake word](#wake-word) before enabling either.
+default): fast and custom commands are deterministic and fully offline. Read
+[AI agent](#ai-agent) before enabling it.
 
 ## Requirements
 
@@ -43,10 +42,9 @@ and fully offline. Read [AI agent](#ai-agent) and
 - **Roku Remote** / **Apple TV Remote** (optional, for TV control).
 
 Everything else ships with Omarchy — a recorder (`pw-record`, `parecord`, or
-`arecord`), `jq`, and `python3`. The
-wake word installs its own stack (`openwakeword`, `onnxruntime`, `sounddevice`)
-into a private venv. Text-to-speech auto-detects `espeak-ng`/`espeak`/`spd-say`/
-`flite` and is silent if none is installed.
+`arecord`), `jq`, and `python3` (for `--lang python` scripts). Text-to-speech
+auto-detects `espeak-ng`/`espeak`/`spd-say`/`flite` and is silent if none is
+installed.
 
 ## How it works
 
@@ -68,7 +66,6 @@ orchestrates the stages and renders the overlay.
 |---------|-----|
 | Tap to talk | Click the bar microphone, speak, and it stops and runs automatically |
 | Menu | Right-click the microphone — a popup under the icon (type a command, or open Manage) |
-| Wake word | Optional hands-free listening — skip it for click-to-talk; see below |
 | Keyboard | Optional — add your own bind |
 
 Listening starts and stops with a short beep (`audio.feedback: false` to mute).
@@ -255,36 +252,6 @@ failed last run with ❌ (✅ on success); editing one clears the error and
 unblocks it. Errors live in `~/.local/state/genesis/errors.json`; every action
 is logged in `~/.local/state/genesis/log.json`.
 
-## Wake word
-
-**Skip this for click-to-talk.** The recommended setup doesn't need it — this is
-an opt-in, always-listening trigger, and leaving it off keeps the microphone
-from running continuously. Only set it up if you specifically want hands-free
-use.
-
-Optional hands-free trigger using [openWakeWord](https://github.com/dscripka/openWakeWord)
-(MIT), a real keyword spotter. One-time setup, then start it (or add
-`wake-word start` to your autostart):
-
-```bash
-~/.config/omarchy/plugins/genesis/bin/wake-word-setup
-~/.config/omarchy/plugins/genesis/bin/wake-word start
-```
-
-Set `wakeWord.model` to any shipped phrase — the default is `hey_jarvis`:
-
-| `wakeWord.model` | Detected phrase |
-|------------------|-----------------|
-| `hey_jarvis` | "hey jarvis" |
-| `alexa` | "alexa" |
-| `hey_mycroft` | "hey mycroft" |
-| `hey_rhasspy` | "hey rhasspy" |
-
-Tune sensitivity with `wakeWord.threshold` (default `0.5`). For a phrase
-openWakeWord doesn't ship (e.g. "hey omarchy"), train a custom model once (see
-the [training notebook](https://github.com/alfiedennen/openwakeword-colab-2026))
-and point `wakeWord.model` at the resulting `.onnx` file.
-
 ## Confirmation
 
 `shutdown`, `reboot`, `logout`, and `suspend` require confirmation: Genesis
@@ -300,7 +267,6 @@ example):
 
 - `agent.enabled` — hand unmatched requests to the coding agent. Default
   `false`; see the AI agent section for the risk before enabling.
-- `wakeWord.model` / `wakeWord.threshold` — wake-word model and sensitivity.
 - `homeAssistant.entities` — spoken-name → entity-ID map (the token lives in the
   `hass` plugin, not here).
 - `tv.backend` — `roku`, `apple-tv`, `auto`, or `off`.
@@ -364,7 +330,7 @@ safe.
 
 ```
 BarWidget.qml ──IPC──▶ omarchy-shell ──▶ Service.qml (service)
-keybinds/wake-word ──IPC──▶                │  capture (pw-record)
+keybinds ──IPC──▶                          │  capture (pw-record)
                                            ▼
                                      bin/transcribe (voxtype)
                                            ▼
@@ -390,7 +356,7 @@ omarchy plugin remove genesis
 ## Development
 
 ```bash
-bash tests/validate.sh      # manifest schema, bash -n, python syntax, JSON
+bash tests/validate.sh      # manifest schema, bash -n, JSON
 bash tests/intent.sh        # intent + entity-resolution regression tests
 bash tests/routine.sh       # one-off scheduling (once/at) arg construction
 bash tests/config.sh        # command/routine export + import

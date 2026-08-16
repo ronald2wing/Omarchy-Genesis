@@ -8,9 +8,8 @@ import qs.Ui
 // Genesis — a voice-controlled AI agent for Omarchy.
 //
 // Loaded as a `service` plugin by omarchy-shell (Quattro). It is driven over
-// IPC (`omarchy-shell -q genesis <method>`) by the bar widget, keybindings,
-// and the wake-word listener, and renders its own listening/confirmation
-// overlay.
+// IPC (`omarchy-shell -q genesis <method>`) by the bar widget and keybindings,
+// and renders its own listening/confirmation overlay.
 //
 // Pipeline: capture -> transcribe -> intent (rules, custom commands, then
 // coding agent) -> execute (Omarchy command, plugin IPC, or agent launch).
@@ -33,24 +32,10 @@ Item {
   readonly property string runtimeDir:
     (Quickshell.env("XDG_RUNTIME_DIR") || "/run/user/" + Quickshell.env("UID")) + "/genesis"
   readonly property string wavPath: runtimeDir + "/recording.wav"
-  // Must match WAKE_WORD_VENV in bin/lib.sh (the wake-word scripts live here).
-  readonly property string wakeWordVenv:
-    (Quickshell.env("XDG_DATA_HOME") || (home + "/.local/share")) + "/genesis/wake-word-venv"
-
-  // True once the wake word has been set up (its venv exists), so the listening
-  // overlay can skip the setup hint for people who already have it.
-  property bool wakeWordInstalled: false
 
   // True when the voxtype dictation engine is on PATH, so click-to-talk can
   // explain why voice input is unavailable instead of recording then failing.
   property bool voxtypeInstalled: true
-
-  FileView {
-    path: root.wakeWordVenv + "/pyvenv.cfg"
-    printErrors: false
-    onLoaded: root.wakeWordInstalled = true
-    onLoadFailed: root.wakeWordInstalled = false
-  }
 
   Process {
     id: voxtypeCheck
@@ -477,15 +462,6 @@ Item {
           color: Color.popups.text
           font.family: Style.font.family
           font.pixelSize: Style.font.title
-        }
-
-        Text {
-          anchors.horizontalCenter: parent.horizontalCenter
-          visible: root.phase === "listening" && !root.wakeWordInstalled
-          text: "A wake word (e.g. \"hey jarvis\") starts listening hands-free — run bin/wake-word-setup"
-          color: Util.alpha(Color.popups.text, 0.62)
-          font.family: Style.font.family
-          font.pixelSize: Style.font.caption
         }
       }
     }
